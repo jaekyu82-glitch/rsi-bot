@@ -289,6 +289,7 @@ class RsiApp(App):
         self.service_active = False
         self.service_session = None
         self.service_process = None   # PC에서 시험할 때만 사용
+        self.revived_at = None        # 마지막으로 서비스를 다시 띄운 시각
         self.stop_requested_at = None
         self.status_tick = 0
 
@@ -737,6 +738,24 @@ class RsiApp(App):
             env = dict(os.environ, RSIBOT_DATA=str(self.data_dir))
             self.service_process = subprocess.Popen([sys.executable, str(HERE / "service.py")], env=env)
 
+    def revive_service(self):
+        """진행 중인 자동매매가 있는데 서비스 신호가 끊겼으면 서비스를 다시 띄웁니다.
+
+        작업 내용은 지우지 않으므로 서비스가 같은 설정으로 이어서 실행합니다.
+        진행 중인 작업이 없으면 False를 돌려줍니다.
+        """
+        if bridge.load_job(self.bridge_root) is None:
+            return False
+        now = time.monotonic()
+        if self.revived_at is None or now - self.revived_at >= 30:
+            self.revived_at = now
+            try:
+                if on_android() or self.service_process is None or self.service_process.poll() is not None:
+                    self.launch_service()
+            except Exception:
+                pass
+        return True
+
     def force_stop_service(self):
         try:
             if on_android():
@@ -786,6 +805,12 @@ class RsiApp(App):
             self.running_symbols = tuple(status.get("symbols", ()))
             self.set_busy_buttons()
             self.apply_service_status(status)
+        elif status is not None and status.get("state") in ("starting", "running") and self.revive_service():
+            self.service_active = True
+            self.service_session = status.get("session")
+            self.running_symbols = tuple(status.get("symbols", ()))
+            self.set_busy_buttons()
+            self.set_status("백그라운드 자동매매 재연결 중")
         elif status is not None and status.get("state") in ("starting", "running"):
             bridge.clear_job(self.bridge_root)
             bridge.write_status(self.bridge_root, **{**status, "state": "done"})
@@ -813,10 +838,16 @@ class RsiApp(App):
         if status.get("state") == "done":
             self.poll_log()
             self.finish_service(status.get("message") or "중지됨")
+        elif not bridge.is_alive(status) and self.stop_requested_at is None and self.revive_service():
+            self.set_status("백그라운드 자동매매 재연결 중")   # 신호가 끊겨도 끝내지 않고 다시 띄웁니다.
         elif not bridge.is_alive(status):
             self.force_stop_service()
             bridge.clear_job(self.bridge_root)
-            self.finish_service("백그라운드 자동매매가 응답하지 않아 종료했습니다. 다시 시작하세요.")
+            if self.stop_requested_at is not None:
+                bridge.write_status(self.bridge_root, **{**status, "state": "done", "message": "중지됨"})
+                self.finish_service("중지됨")
+            else:
+                self.finish_service("백그라운드 자동매매가 응답하지 않아 종료했습니다. 다시 시작하세요.")
         elif self.stop_requested_at is not None and time.monotonic() - self.stop_requested_at > 45:
             self.force_stop_service()
             bridge.clear_job(self.bridge_root)
