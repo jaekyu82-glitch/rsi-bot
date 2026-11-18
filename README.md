@@ -9,7 +9,7 @@
 3. 완료되면 같은 화면 아래 **Artifacts → rsi-demo-apk** 를 내려받아 압축을 풀고 `.apk`를 폰에 설치합니다.
    (설정에서 "출처를 알 수 없는 앱 설치" 허용 필요)
 
-Linux/WSL에서 직접 빌드: `pip install buildozer cython==0.29.36` 후 `buildozer android debug`
+Linux/WSL에서 직접 빌드: `pip install buildozer cython==3.0.12` 후 `buildozer android debug`
 
 ## 사용법
 - 설정 탭: 방향/봉/종목, 롱·숏 주문 및 RSI 조건, 데모 API Key·Secret 입력

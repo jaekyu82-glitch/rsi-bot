@@ -29,7 +29,7 @@ jobs:
             zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
 
       - name: Install buildozer
-        run: pip install --upgrade buildozer "cython==0.29.36" setuptools
+        run: pip install --upgrade buildozer "cython==3.0.12" setuptools
 
       - name: Cache buildozer
         uses: actions/cache@v4

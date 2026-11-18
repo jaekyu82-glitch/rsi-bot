@@ -6,7 +6,7 @@ source.dir = .
 source.include_exts = py,ttf,txt
 source.exclude_dirs = .github,bin,.buildozer,__pycache__
 version = 12.0
-requirements = python3,kivy==2.3.0,openssl,sqlite3,pyjnius,android
+requirements = python3,kivy==2.3.1,openssl,sqlite3,pyjnius,android
 orientation = portrait
 fullscreen = 0
 android.permissions = INTERNET,WAKE_LOCK,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC,POST_NOTIFICATIONS,REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
