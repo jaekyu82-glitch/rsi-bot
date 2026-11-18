@@ -2,15 +2,19 @@
 
 전략·주문·백테스트는 core.py(원본 로직)를 그대로 사용하고,
 이 파일은 모바일 화면과 스레드 연결만 담당합니다. 바이낸스 '데모' 서버 전용입니다.
+자동매매는 service.py(안드로이드 포그라운드 서비스)에서 돌기 때문에 앱이 백그라운드로
+가거나 화면이 꺼져도 계속됩니다. 화면과 서비스는 bridge.py로 연결됩니다.
 """
 
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
-from queue import Empty, Full, Queue, SimpleQueue
+from queue import Empty, Queue, SimpleQueue
 from threading import Event, Thread
 
 from kivy.app import App
@@ -31,6 +35,7 @@ from kivy.uix.tabbedpanel import TabbedPanel, TabbedPanelItem
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
+import bridge
 import core
 from core import (
     DEFAULT_ENTRY, DEFAULT_SHORT_ENTRY, EntrySettings, MAX_WAIT_MINUTES,
@@ -91,10 +96,56 @@ def request_permissions():
     if not on_android():
         return
     try:
-        from android.permissions import Permission, request_permissions as ask
-        ask([Permission.INTERNET])
+        from android.permissions import request_permissions as ask
+        wanted = ["android.permission.INTERNET"]
+        if sys.getandroidapilevel() >= 33:  # 안드로이드 13+: 실행 중 알림 표시 권한
+            wanted.append("android.permission.POST_NOTIFICATIONS")
+        ask(wanted)
     except Exception:
         pass
+
+
+def android_activity():
+    from jnius import autoclass
+    return autoclass("org.kivy.android.PythonActivity").mActivity
+
+
+def service_class():
+    from jnius import autoclass
+    return autoclass(android_activity().getPackageName() + ".ServiceTrader")
+
+
+def request_battery_exemption():
+    """배터리 최적화에서 이 앱을 빼 달라고 요청합니다 (한 번 허용하면 다시 묻지 않음)."""
+    if not on_android():
+        return
+    try:
+        from jnius import autoclass
+        activity = android_activity()
+        context = autoclass("android.content.Context")
+        package = activity.getPackageName()
+        power = activity.getSystemService(context.POWER_SERVICE)
+        if power.isIgnoringBatteryOptimizations(package):
+            return
+        intent_class = autoclass("android.content.Intent")
+        settings = autoclass("android.provider.Settings")
+        uri = autoclass("android.net.Uri")
+        intent = intent_class(settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+        intent.setData(uri.parse("package:" + package))
+        activity.startActivity(intent)
+    except Exception:
+        pass
+
+
+def move_to_background():
+    """뒤로 가기를 눌러도 앱을 끄지 않고 홈 화면으로 보냅니다."""
+    if not on_android():
+        return False
+    try:
+        android_activity().moveTaskToBack(True)
+        return True
+    except Exception:
+        return False
 
 
 # ───────────────────────── 위젯 도우미 ─────────────────────────
@@ -233,6 +284,13 @@ class RsiApp(App):
         request_permissions()
         self.data_dir = core.configure_data_dir(Path(self.user_data_dir))
         self.key_path = self.data_dir / KEY_FILE
+        self.bridge_root = bridge.root_dir(self.data_dir)
+        self.log_tail = bridge.LogTail(self.bridge_root)
+        self.service_active = False
+        self.service_session = None
+        self.service_process = None   # PC에서 시험할 때만 사용
+        self.stop_requested_at = None
+        self.status_tick = 0
 
         self.messages = SimpleQueue()
         self.updates = SimpleQueue()
@@ -268,6 +326,7 @@ class RsiApp(App):
         root.add_widget(self.tabs)
 
         self.load_saved_keys()
+        self.attach_service()
         Clock.schedule_interval(self.refresh, 0.2)
         Window.bind(on_keyboard=self._on_back)
         return root
@@ -500,8 +559,8 @@ class RsiApp(App):
             return False
         new_settings = EntrySettings(long.first_rsi, long.wait_minutes, long.second_rsi,
                                      long.order, direction, short, self.timeframe.text)
-        if self.worker is not None and new_settings != self.applied:
-            self.updates.put(new_settings)
+        if self.service_active and new_settings != self.applied:
+            bridge.send_command(self.bridge_root, "update", new_settings)
             self.set_status("새 조건 적용 요청 · 적용 결과는 실행 로그에 표시됩니다.")
         else:
             self.set_status("진입 조건 설정 완료")
@@ -523,8 +582,11 @@ class RsiApp(App):
             widget.disabled = True
         self.stop_button.disabled = False
 
+    def busy(self):
+        return self.worker is not None or self.service_active
+
     def start(self, check_only=False, days=None, test_settings=None, manual_order=None):
-        if self.worker is not None:
+        if self.busy():
             return
         if days is None and not check_only and manual_order is None and not self.apply():
             return
@@ -547,6 +609,9 @@ class RsiApp(App):
             self.set_status("자동매매 종목을 하나 이상 선택하세요.")
             return
         self.running_symbols = selected
+        if days is None and not check_only and manual_order is None:
+            self.start_service(key, secret, settings, selected, target_symbol)
+            return
         self.stop.clear()
         messages, stop = self.messages, self.stop
         updates, manual_orders, wake = self.updates, self.manual_orders, self.wake
@@ -596,7 +661,9 @@ class RsiApp(App):
         self.worker.start()
 
     def start_manual(self, direction):
-        if self.worker is not None and (not self.auto_running or self.stop.is_set()):
+        if self.service_active and (not self.auto_running or self.stop_requested_at is not None):
+            return
+        if self.worker is not None:
             return
         name = "롱" if direction == "long" else "숏"
         try:
@@ -605,19 +672,14 @@ class RsiApp(App):
             self.set_status(f"{name} 주문 설정 · {exc}")
             return
         request = (direction, order)
-        if self.worker is None:
+        if not self.service_active:
             self.start(manual_order=request)
             return
         if self.order_symbol.text not in self.running_symbols:
             self.set_status("선택한 종목을 자동매매 종목에 포함해 다시 시작하세요.")
             return
-        try:
-            self.manual_orders.put_nowait((self.order_symbol.text, *request, time.monotonic() + 15))
-        except Full:
-            self.set_status("앞선 시장가 진입 요청을 처리 중입니다.")
-        else:
-            self.wake.set()
-            self.set_status(f"데모 {name} 시장가 진입 요청 접수 · 실행 로그를 확인하세요.")
+        bridge.send_command(self.bridge_root, "manual", self.order_symbol.text, *request)
+        self.set_status(f"데모 {name} 시장가 진입 요청 접수 · 실행 로그를 확인하세요.")
 
     def ask_backtest(self, direction):
         name = "롱" if direction == "long" else "숏"
@@ -627,7 +689,7 @@ class RsiApp(App):
             self.set_status(f"{name} 설정 · {exc}")
             self.tabs.switch_to(self.run_tab)
             return
-        if self.worker is not None:
+        if self.busy():
             self.set_status("실행 중에는 백테스트를 시작할 수 없습니다. 먼저 중지하세요.")
             self.tabs.switch_to(self.run_tab)
             return
@@ -655,11 +717,130 @@ class RsiApp(App):
         popup.open()
 
     def request_stop(self):
-        self.stop.set()
-        self.wake.set()
+        if self.service_active:
+            bridge.send_command(self.bridge_root, "stop")
+            self.stop_requested_at = time.monotonic()
+        else:
+            self.stop.set()
+            self.wake.set()
         for widget in (self.long_button, self.short_button):
             widget.disabled = True
         self.set_status("중지 요청 · 진행 중인 요청을 마무리하는 중")
+
+    # ── 백그라운드 자동매매 서비스 ──
+
+    def launch_service(self):
+        if on_android():
+            service_class().start(android_activity(), "", "BTC·ETH 데모 자동매매",
+                                  "자동매매 실행 중 · 누르면 앱이 열립니다", "")
+        else:  # PC에서 시험할 때는 별도 프로세스로 실행
+            env = dict(os.environ, RSIBOT_DATA=str(self.data_dir))
+            self.service_process = subprocess.Popen([sys.executable, str(HERE / "service.py")], env=env)
+
+    def force_stop_service(self):
+        try:
+            if on_android():
+                service_class().stop(android_activity())
+            elif self.service_process is not None:
+                self.service_process.terminate()
+        except Exception:
+            pass
+
+    def start_service(self, key, secret, settings, symbols, order_symbol):
+        root = self.bridge_root
+        session = uuid.uuid4().hex
+        bridge.clear_commands(root)
+        bridge.save_job(root, {
+            "session": session, "key": key, "secret": secret, "settings": settings,
+            "symbols": list(symbols), "order_symbol": order_symbol, "data_dir": str(self.data_dir),
+        })
+        bridge.write_status(root, state="starting", message="데모 자동매매 시작 중", session=session,
+                            symbols=list(symbols))
+        bridge.reset_log(root)
+        self.log_tail.reset()
+        self.log_tail.read()
+        try:
+            self.launch_service()
+        except Exception as exc:
+            bridge.clear_job(root)
+            bridge.write_status(root, state="done", message="시작 실패", session=session)
+            self.set_status(f"백그라운드 실행을 시작하지 못했습니다 · {exc}")
+            return
+        self.service_active = True
+        self.service_session = session
+        self.stop_requested_at = None
+        self.auto_running = False
+        self.status_tick = 0
+        self.set_busy_buttons()
+        self.set_status("데모 자동매매 시작 중 (백그라운드)")
+        self.tabs.switch_to(self.run_tab)
+        request_battery_exemption()
+
+    def attach_service(self):
+        """앱을 다시 열었을 때 이미 돌고 있는 백그라운드 자동매매에 다시 연결합니다."""
+        status = bridge.read_status(self.bridge_root)
+        self.poll_log()
+        if bridge.is_alive(status):
+            self.service_active = True
+            self.service_session = status.get("session")
+            self.running_symbols = tuple(status.get("symbols", ()))
+            self.set_busy_buttons()
+            self.apply_service_status(status)
+        elif status is not None and status.get("state") in ("starting", "running"):
+            bridge.clear_job(self.bridge_root)
+            bridge.write_status(self.bridge_root, **{**status, "state": "done"})
+            self.set_status("이전 백그라운드 자동매매가 비정상 종료되었습니다. 다시 시작하세요.")
+
+    def poll_log(self):
+        restarted, text = self.log_tail.read()
+        if restarted:
+            self.log_text = ""
+            self.log_view.text = ""
+        if text:
+            self.append_log(text)
+
+    def poll_service(self):
+        if not self.service_active:
+            return
+        self.poll_log()
+        self.status_tick += 1
+        if self.status_tick % 5 != 1:  # 상태 파일은 1초에 한 번 확인
+            return
+        status = bridge.read_status(self.bridge_root)
+        if status is None or status.get("session") != self.service_session:
+            self.finish_service("백그라운드 자동매매 상태를 확인할 수 없습니다.")
+            return
+        if status.get("state") == "done":
+            self.poll_log()
+            self.finish_service(status.get("message") or "중지됨")
+        elif not bridge.is_alive(status):
+            self.force_stop_service()
+            bridge.clear_job(self.bridge_root)
+            self.finish_service("백그라운드 자동매매가 응답하지 않아 종료했습니다. 다시 시작하세요.")
+        elif self.stop_requested_at is not None and time.monotonic() - self.stop_requested_at > 45:
+            self.force_stop_service()
+            bridge.clear_job(self.bridge_root)
+            bridge.write_status(self.bridge_root, **{**status, "state": "done", "message": "강제 중지됨"})
+            self.finish_service("중지 처리가 늦어 강제로 종료했습니다. 거래소의 손절·익절 주문은 유지됩니다.")
+        else:
+            self.apply_service_status(status)
+
+    def apply_service_status(self, status):
+        if self.stop_requested_at is not None:
+            return
+        if status.get("state") == "running" and not self.auto_running:
+            self.auto_running = True
+            for widget in (self.long_button, self.short_button):
+                widget.disabled = False
+        self.set_status(status.get("message") or "실행 중")
+
+    def finish_service(self, message):
+        self.service_active = False
+        self.service_session = None
+        self.stop_requested_at = None
+        self.auto_running = False
+        self.set_idle_buttons()
+        self.set_status(message)
 
     # ── 큐 처리 ──
 
@@ -673,6 +854,7 @@ class RsiApp(App):
         Clock.schedule_once(lambda *_: setattr(self.log_scroll, "scroll_y", 0), 0.05)
 
     def refresh(self, _dt):
+        self.poll_service()
         try:
             while True:
                 kind, message = self.messages.get_nowait()
@@ -733,15 +915,23 @@ class RsiApp(App):
     # ── 시스템 이벤트 ──
 
     def _on_back(self, window, key, *args):
-        if key == 27 and self.worker is not None:  # 뒤로 가기: 실행 중에는 앱을 닫지 않음
+        if key != 27:
+            return False
+        if self.service_active and move_to_background():  # 자동매매는 백그라운드에서 계속
+            return True
+        if self.busy():  # 뒤로 가기: 실행 중에는 앱을 닫지 않음
             self.set_status("실행 중입니다. 종료하려면 중지 버튼을 누르세요.")
             return True
         return False
 
     def on_pause(self):
-        return True  # 홈 버튼으로 나가도 스레드 유지
+        return True  # 홈 버튼으로 나가도 유지 (자동매매는 서비스가 따로 계속 실행)
+
+    def on_resume(self):
+        self.status_tick = 0  # 돌아오면 서비스 상태를 바로 다시 확인
 
     def on_stop(self):
+        # 백테스트·연결 확인 같은 화면 작업만 멈춥니다. 백그라운드 자동매매는 계속됩니다.
         self.stop.set()
         self.wake.set()
 

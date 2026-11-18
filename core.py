@@ -26,7 +26,7 @@ from uuid import uuid4
 
 AUTHOR = "박재규"
 CREATED_ON = "2026년 11월 15일"
-PROGRAM_VERSION = "11"
+PROGRAM_VERSION = "12"
 PROGRAM_CREDITS = f"제작자 {AUTHOR} · 제작일 {CREATED_ON} · 버전 {PROGRAM_VERSION}"
 
 BASE = "https://demo-fapi.binance.com"
